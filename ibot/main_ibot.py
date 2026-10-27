@@ -171,6 +171,9 @@ def get_args_parser():
         buffers. Default: off with --gpu_aug (raw volumes of many sizes: the pinned-memory cache grows by tens of GB
         and stalls the loader for minutes at batch 32, while the copy it speeds up is <1%% of a step), on otherwise.""")
     parser.add_argument('--log_freq', type=int, default=20, help="Print and sync metrics every N iterations.")
+    parser.add_argument('--max_iters', type=int, default=0, help="Stop after N iterations (benchmarks/smoke tests).")
+    parser.add_argument('--stop_epoch', type=int, default=0, help="""Stop after this many epochs, with the
+        checkpoint and log.txt written; the schedules still follow --epochs (short A/B runs of the real recipe).""")
     # Recipe options (change what the model sees; defaults = original behaviour)
     parser.add_argument('--intensity_norm', default='minmax', choices=['minmax', 'hu_window'], help="""Per-volume
         min-max scaling (original) or a fixed HU window mapped to [0, 1].""")
@@ -447,6 +450,10 @@ def train_ibot(args):
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss,
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
+        iters_done = train_stats.pop('iters')
+        if args.max_iters and len(data_loader) * epoch + iters_done >= args.max_iters:
+            print(f"Reached --max_iters {args.max_iters}; stopping without checkpoint.")
+            break
 
         # ============ writing logs ... ============
         save_dict = {
@@ -469,6 +476,9 @@ def train_ibot(args):
                 f.write(json.dumps(log_stats) + "\n")
                 for k, v in train_stats.items():
                     writer.add_scalar(k, v, epoch)
+        if args.stop_epoch and epoch + 1 >= args.stop_epoch:
+            print(f"Reached --stop_epoch {args.stop_epoch}; checkpoint saved, stopping.")
+            break
         
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -514,6 +524,10 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             for v in vs:
                 metric_logger.meters[k].update(v)
 
+    # collapse monitor: which teacher CLS prototypes are used this epoch (summed on the GPU, read once per epoch)
+    proto_counts = torch.zeros(args.out_dim, dtype=torch.long, device='cuda')
+    proto_prob_sum = torch.zeros(args.out_dim, device='cuda')
+
     n_iters = len(data_loader)
     it_in_epoch = 0
     for it_in_epoch, (images, masks) in enumerate(metric_logger.log_every(data_loader, args.log_freq, header)):
@@ -544,6 +558,16 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
 
             all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch)
             loss = all_loss.pop('loss')
+
+        # collapse monitor on the teacher CLS targets as the loss uses them (centred, sharpened). A low CLS loss alone
+        # can mean collapse: t_ent ~ ln(out_dim) = stuck at uniform, ~0 with few prototypes per epoch = one-hot collapse
+        with torch.no_grad():
+            t_prob = F.softmax((teacher_output[0].float() - ibot_loss.center) / ibot_loss.teacher_temp_schedule[epoch],
+                               dim=-1)
+            t_ent = -(t_prob * torch.log(t_prob.clamp_min(1e-12))).sum(-1).mean()
+            t_arg = t_prob.argmax(-1)
+            proto_counts.index_add_(0, t_arg, torch.ones_like(t_arg))
+            proto_prob_sum += t_prob.sum(0)
 
         # log statistics
         probs1 = teacher_output[0].chunk(args.global_crops_number)
@@ -578,19 +602,29 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
         # logging
-        for key, value in [('loss', loss), ('acc', acc)] + list(all_loss.items()):
+        for key, value in [('loss', loss), ('acc', acc), ('t_ent', t_ent)] + list(all_loss.items()):
             pending.setdefault(key, []).append(value.detach().float())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-        if it_in_epoch % args.log_freq == 0 or it_in_epoch == n_iters - 1:
+        reached_max = args.max_iters and it + 1 >= args.max_iters
+        if it_in_epoch % args.log_freq == 0 or it_in_epoch == n_iters - 1 or reached_max:
             flush_metrics()
+        if reached_max:
+            break
     flush_metrics()
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
+    # prototypes the teacher's argmax used this epoch, and the entropy of its epoch-mean distribution
+    # (healthy: many prototypes and a high mean entropy while each t_ent is low)
+    p_mean = proto_prob_sum / proto_prob_sum.sum()
+    return_dict['t_protos'] = int((proto_counts > 0).sum())
+    return_dict['t_mean_ent'] = float(-(p_mean * torch.log(p_mean.clamp_min(1e-12))).sum())
+    print(f"Teacher CLS prototypes used: {return_dict['t_protos']} / {args.out_dim}, "
+          f"entropy of mean target: {return_dict['t_mean_ent']:.3f} (max {math.log(args.out_dim):.3f})")
+    return_dict['iters'] = it_in_epoch + 1
 
     return return_dict
 
