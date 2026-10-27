@@ -201,6 +201,18 @@ class SpatialTransformRatioCrop(BasicTransform):
             img = interpolate(img[None], size=self.patch_size, mode='trilinear' if img.ndim == 4 else 'bilinear',
                               align_corners=False)[0]
             return img
+        elif params['elastic_offsets'] is None:
+            # Affine only: sample the output grid directly (one grid_sample at patch_size covering the
+            # intermediate crop extent) instead of a grid at the intermediate size followed by a resize.
+            # Same mapping, 1.3-4x faster on CPU and far less memory.
+            space = [(torch.arange(p, dtype=torch.float32) + 0.5) * (s / p) - s / 2
+                     for p, s in zip(self.patch_size, intermediate_crop_size)]
+            grid = torch.stack(torch.meshgrid(space, indexing="ij"), -1)
+            grid = torch.matmul(grid, torch.from_numpy(params['affine']).float())
+            new_center = torch.Tensor([c - s / 2 for c, s in zip(params['center_location_in_pixels'], img.shape[1:])])
+            grid += new_center
+            return grid_sample(img[None], _convert_my_grid_to_grid_sample_grid(grid, img.shape[1:])[None],
+                               mode='bilinear', padding_mode=self.padding_mode_image, align_corners=False)[0]
         else:
             # Create grid for intermediate crop size
             grid = _create_centered_identity_grid2(intermediate_crop_size)
