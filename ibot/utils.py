@@ -165,6 +165,19 @@ def clip_gradients(model, clip):
     return norms
 
 
+def clip_gradients_foreach(model, clip):
+    """Same per-parameter clipping as clip_gradients, without a host sync (.item()) per parameter."""
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return
+    norms = torch._foreach_norm(grads)
+    coefs = torch._foreach_add(norms, 1e-6)
+    torch._foreach_reciprocal_(coefs)
+    torch._foreach_mul_(coefs, clip)
+    torch._foreach_clamp_max_(coefs, 1.0)
+    torch._foreach_mul_(grads, coefs)
+
+
 def cancel_gradients_last_layer(epoch, model, freeze_last_layer):
     if epoch >= freeze_last_layer:
         return
@@ -506,7 +519,8 @@ def init_distributed_mode(args):
         print('Will run the code on one GPU.')
         args.rank, args.gpu, args.world_size = 0, 0, 1
         os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = '29500'
+        # keep an exported MASTER_PORT so two single-GPU runs can share a machine
+        os.environ.setdefault('MASTER_PORT', '29500')
     else:
         print('Does not support training without GPU.')
         sys.exit(1)
