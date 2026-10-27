@@ -580,7 +580,10 @@ class iBOTLoss(nn.Module):
         total_loss1, n_loss_terms1 = 0, 0
         total_loss2, n_loss_terms2 = 0, 0
         for q in range(len(teacher_patch_c)):
-            for v in range(len(student_patch_c)):
+            # [CLS] terms pair each teacher global view with every other student view, local crops included.
+            # Patch outputs exist only for the global views: looping over student_patch_c (as in eb28c32) silently
+            # dropped every local crop from the loss.
+            for v in range(len(student_cls_c) if compute_cls_loss else len(student_patch_c)):
                 if v == q:
                     loss2 = torch.sum(-teacher_patch_c[q] * F.log_softmax(student_patch_c[v], dim=-1), dim=-1)
                     mask = student_mask[v].flatten(1)
