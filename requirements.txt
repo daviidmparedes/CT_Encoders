@@ -4,3 +4,9 @@ SimpleITK==2.4.1
 monai==1.4.0
 einops==0.8.0
 batchgeneratorsv2==0.3.0
+# this fork: cache tools and run analysis (tools/)
+numpy==1.26.4
+scipy==1.17.1
+nibabel==5.4.2
+pyarrow==25.0.1
+matplotlib==3.11.2

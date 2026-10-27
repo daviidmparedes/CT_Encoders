@@ -172,3 +172,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+# Local only: training runs, experiment results and working notes
+runs/
+david-ct/*
+!david-ct/CODE.md
+!david-ct/metadata/
