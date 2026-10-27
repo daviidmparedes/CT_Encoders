@@ -171,6 +171,12 @@ def get_args_parser():
         buffers. Default: off with --gpu_aug (raw volumes of many sizes: the pinned-memory cache grows by tens of GB
         and stalls the loader for minutes at batch 32, while the copy it speeds up is <1%% of a step), on otherwise.""")
     parser.add_argument('--log_freq', type=int, default=20, help="Print and sync metrics every N iterations.")
+    # Recipe options (change what the model sees; defaults = original behaviour)
+    parser.add_argument('--intensity_norm', default='minmax', choices=['minmax', 'hu_window'], help="""Per-volume
+        min-max scaling (original) or a fixed HU window mapped to [0, 1].""")
+    parser.add_argument('--hu_window', type=float, nargs=2, default=(-1000., 1000.))
+    parser.add_argument('--crop_inside', type=utils.bool_flag, default=False, help="""Keep random crops inside
+        the volume (original: centres anywhere, so a global crop is ~56%% zero padding).""")
     return parser
 
 def train_ibot(args):
@@ -190,6 +196,9 @@ def train_ibot(args):
         args.local_crops_scale,
         args.global_crops_number,
         args.local_crops_number,
+        intensity_norm=args.intensity_norm,
+        hu_window=args.hu_window,
+        crop_inside=args.crop_inside,
     )
     pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
     gpu_aug, collate_fn = None, None
@@ -208,6 +217,9 @@ def train_ibot(args):
             args.local_crops_scale,
             args.global_crops_number,
             args.local_crops_number,
+            intensity_norm=args.intensity_norm,
+            hu_window=args.hu_window,
+            crop_inside=args.crop_inside,
             seed=args.seed + utils.get_rank())
         collate_fn = collate_volumes
     elif args.arch == "swin3D":

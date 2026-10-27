@@ -270,6 +270,20 @@ class MinMaxScalingTransform(ImageOnlyTransform):
         img = (img - params['mins']) * params['scale'] + params['a']
         return img
     
+class HUWindowTransform(ImageOnlyTransform):
+    """Fixed HU window -> [0, 1]. Unlike per-volume min-max, every source gets the same intensity mapping."""
+    def __init__(self, window=(-1000.0, 1000.0)):
+        super().__init__()
+        self.window = window
+
+    def get_parameters(self, **data_dict):
+        return {}
+
+    def _apply_to_image(self, img: torch.Tensor, **params) -> torch.Tensor:
+        lo, hi = self.window
+        return (img.clamp(lo, hi) - lo) / (hi - lo)
+
+
 class ClipIntensityTransform(ImageOnlyTransform):
     def __init__(self, min_val=0.0, max_val=1.0):
         super().__init__()
@@ -283,19 +297,21 @@ class ClipIntensityTransform(ImageOnlyTransform):
         return torch.clamp(img, self.min_val, self.max_val)
 
 class DataAugmentationCTiBOT2(object):
-    def __init__(self, global_crops_scale, local_crops_scale, global_crops_number, local_crops_number):
+    def __init__(self, global_crops_scale, local_crops_scale, global_crops_number, local_crops_number,
+                 intensity_norm='minmax', hu_window=(-1000.0, 1000.0), crop_inside=False):
         global_crops_size = 3*(224,)
         local_crops_size = 3*(96,)
         ignore_axes = None        
         def build_transform(patch_size, crop_scale):
             return ComposeTransforms([
-                MinMaxScalingTransform(target_range=(0, 1)),
+                MinMaxScalingTransform(target_range=(0, 1)) if intensity_norm == 'minmax' else HUWindowTransform(hu_window),
 
                 SpatialTransformRatioCrop(
                     patch_size,
                     patch_center_dist_from_border=0,
                     random_crop=True,
                     crop_scale=crop_scale,
+                    keep_crop_inside=crop_inside,
                     p_elastic_deform=0,
                     p_rotation=0.2,
                     rotation=(-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi),

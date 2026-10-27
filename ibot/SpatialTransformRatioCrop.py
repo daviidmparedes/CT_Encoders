@@ -31,7 +31,8 @@ class SpatialTransformRatioCrop(BasicTransform):
                  mode_seg: str = 'bilinear',
                  border_mode_seg: str = "zeros",
                  center_deformation: bool = True,
-                 padding_mode_image: str = "zeros"
+                 padding_mode_image: str = "zeros",
+                 keep_crop_inside: bool = False,
                  ):
         """
         NEW PARAMETER:
@@ -70,6 +71,8 @@ class SpatialTransformRatioCrop(BasicTransform):
         self.border_mode_seg = border_mode_seg
         self.center_deformation = center_deformation
         self.padding_mode_image = padding_mode_image
+        # keep the crop centre at least half a crop away from the border (otherwise ~56% of a global crop is padding)
+        self.keep_crop_inside = keep_crop_inside
 
     def _calculate_crop_size(self, image_shape: Tuple[int, ...], volume_ratio: float) -> Tuple[int, ...]:
         if not (0 <= volume_ratio <= 1):
@@ -163,6 +166,9 @@ class SpatialTransformRatioCrop(BasicTransform):
             for d in range(dim):
                 mn = self.patch_center_dist_from_border[d]
                 mx = image_shape[d] - self.patch_center_dist_from_border[d]
+                if self.keep_crop_inside:
+                    mn = max(mn, intermediate_crop_size[d] / 2)
+                    mx = min(mx, image_shape[d] - intermediate_crop_size[d] / 2)
                 if mx < mn:
                     center_location_in_pixels.append(image_shape[d] / 2)
                 else:
