@@ -217,17 +217,24 @@ class WindowAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         trunc_normal_(self.relative_position_bias_table, std=0.02)
         self.softmax = nn.Softmax(dim=-1)
+        # use F.scaled_dot_product_attention (memory-efficient kernel) instead of materializing
+        # the (windows x heads x n x n) score matrix; numerically equivalent to the explicit path
+        self.fused_attn = True
 
     def forward(self, x, mask):
         b, n, c = x.shape
         qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        q = q * self.scale
-        attn = q @ k.transpose(-2, -1)
         relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.clone()[:n, :n].reshape(-1)
+            self.relative_position_index[:n, :n].reshape(-1)
         ].reshape(n, n, -1)
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        # fp16: the fused kernel takes the bias as an fp16 mask and its gradient underflows (the relative position
+        # bias tables would barely learn), so fp16 keeps the explicit path; bf16/fp32 are exact
+        if self.fused_attn and q.dtype != torch.float16:
+            return self._forward_fused(q, k, v, relative_position_bias, mask, b, n, c)
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
         attn = attn + relative_position_bias.unsqueeze(0)
         if mask is not None:
             nw = mask.shape[0]
@@ -239,6 +246,26 @@ class WindowAttention(nn.Module):
 
         attn = self.attn_drop(attn).to(v.dtype)
         x = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def _forward_fused(self, q, k, v, bias, mask, b, n, c):
+        h = self.num_heads
+        if mask is None:
+            attn_bias = bias.unsqueeze(0).to(q.dtype)  # 1, h, n, n (broadcast over windows)
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_bias, dropout_p=self.attn_drop.p if self.training else 0.0)
+        else:
+            # shifted windows: fold the window index into the head dim so the (nw, h, n, n) bias
+            # broadcasts over the batch instead of being materialized for every window of every sample
+            nw = mask.shape[0]
+            attn_bias = (bias.unsqueeze(0) + mask.unsqueeze(1)).to(q.dtype).reshape(1, nw * h, n, n)
+            q, k, v = (t.reshape(b // nw, nw * h, n, c // h) for t in (q, k, v))
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_bias, dropout_p=self.attn_drop.p if self.training else 0.0)
+            x = x.reshape(b, h, n, c // h)
+        x = x.transpose(1, 2).reshape(b, n, c)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -594,6 +621,14 @@ class BasicLayer(nn.Module):
         self.downsample = downsample
         if callable(self.downsample):
             self.downsample = downsample(dim=dim, norm_layer=norm_layer, spatial_dims=len(self.window_size))
+        self._mask_cache = {}
+
+    def _cached_mask(self, dims, window_size, shift_size, device):
+        # the shifted-window mask only depends on the padded grid size; build it once per shape
+        key = (tuple(dims), tuple(window_size), tuple(shift_size), str(device))
+        if key not in self._mask_cache:
+            self._mask_cache[key] = compute_mask(dims, window_size, shift_size, device)
+        return self._mask_cache[key]
 
     def forward(self, x):
         x_shape = x.size()
@@ -604,7 +639,7 @@ class BasicLayer(nn.Module):
             dp = int(np.ceil(d / window_size[0])) * window_size[0]
             hp = int(np.ceil(h / window_size[1])) * window_size[1]
             wp = int(np.ceil(w / window_size[2])) * window_size[2]
-            attn_mask = compute_mask([dp, hp, wp], window_size, shift_size, x.device)
+            attn_mask = self._cached_mask([dp, hp, wp], window_size, shift_size, x.device)
             for blk in self.blocks:
                 x = blk(x, attn_mask)
             x = x.view(b, d, h, w, -1)
@@ -782,57 +817,52 @@ class SwinTransformer(nn.Module):
         return x
 
     def forward(self, x, normalize=True, return_all_tokens=None, mask=None):
+        return_all_tokens = self.return_all_tokens if \
+            return_all_tokens is None else return_all_tokens
         x0 = self.patch_embed(x)
         # x_out = self.proj_out(x, normalize)
         # x0 = self.patch_embed1(x_out)
         # mask image modeling
         if mask is not None:
             x0 = self.mask_model(x0, mask)
-        
+
         x0 = self.pos_drop(x0)
-        x0_out = self.proj_out(x0, normalize)
         if self.use_v2:
             x0 = self.layers1c[0](x0.contiguous())
         x1 = self.layers1[0](x0.contiguous())
-        x1_out = self.proj_out(x1, normalize)
         if self.use_v2:
             x1 = self.layers2c[0](x1.contiguous())
         x2 = self.layers2[0](x1.contiguous())
-        x2_out = self.proj_out(x2, normalize)
         if self.use_v2:
             x2 = self.layers3c[0](x2.contiguous())
         x3 = self.layers3[0](x2.contiguous())
-        x3_out = self.proj_out(x3, normalize)
         if self.use_v2:
             x3 = self.layers4c[0](x3.contiguous())
         x4 = self.layers4[0](x3.contiguous())
         x4_out = self.proj_out(x4, normalize)
-        
+        if not return_all_tokens:
+            # the multi-scale outputs are only needed here; skip their (full-resolution) layer norms otherwise
+            return [self.proj_out(xi, normalize) for xi in (x0, x1, x2, x3)] + [x4_out]
+
         B, C, D, H, W = x4_out.shape
         x = x4_out.permute(0, 2, 3, 4, 1).reshape(B, D*H*W, C)
         x_region = self.norm(x)  # B L C
         x = self.avgpool(x_region.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
+        return torch.cat([x.unsqueeze(1), x_region], dim=1)
 
-        return_all_tokens = self.return_all_tokens if \
-            return_all_tokens is None else return_all_tokens
-        if return_all_tokens:
-            return torch.cat([x.unsqueeze(1), x_region], dim=1)
-        return [x0_out, x1_out, x2_out, x3_out, x4_out]
-    
     def mask_model(self, x, mask):
         # extend mask for hierarchical features
         if x.shape[-3:] != mask.shape[-3:]:
-            dtimes, htimes, wtimes = np.array(x.shape[-3:]) // np.array(mask.shape[-3:])
+            dtimes, htimes, wtimes = (int(a // b) for a, b in zip(x.shape[-3:], mask.shape[-3:]))
             mask = mask.repeat_interleave(dtimes, -3).repeat_interleave(htimes, -2).repeat_interleave(wtimes, -1)
-        
-        # mask embed
-        x.permute(0, 2, 3, 4, 1)[mask, :] = self.masked_embed.to(x.dtype)
 
-        return x
+        # mask embed (torch.where instead of boolean-index assignment: same result, no data-dependent shapes)
+        embed = self.masked_embed.to(x.dtype).reshape(1, -1, 1, 1, 1)
+        return torch.where(mask.unsqueeze(1), embed, x)
     
 
-def swin_3D(window_size=(7, 7, 7), **kwargs):
+def swin_3D(window_size=(7, 7, 7), fused_attn=True, **kwargs):
     model = SwinTransformer(
             in_chans=1,
             embed_dim=48,
@@ -850,4 +880,7 @@ def swin_3D(window_size=(7, 7, 7), **kwargs):
             downsample="mergingv2",
             **kwargs
         )
+    for m in model.modules():
+        if isinstance(m, WindowAttention):
+            m.fused_attn = fused_attn
     return model
