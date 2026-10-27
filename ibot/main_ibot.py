@@ -26,11 +26,12 @@ from torchvision.ops.misc import Permute
 from torchvision import models as torchvision_models
 from tensorboardX import SummaryWriter
 from models.head import iBOTHead
-from loader import CTFolderMask, CTFolderMask3D
+from loader import CTFolderMask, CTFolderMask3D, CTVolumeMask3D, collate_volumes, worker_init_fn
 from models.swin3D import swin_3D
 from models.vit_lora import vit_lora
 
 from transforms import DataAugmentationCTiBOT2
+from gpu_transforms import GPUAugmentationCTiBOT
 
 def get_args_parser():
     parser = argparse.ArgumentParser('iBOT', add_help=False)
@@ -155,14 +156,33 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     parser.add_argument('--ckpt_path_student', default="/home/mpizarro/data/ibot_pretrained_student.pth", type=str)
     parser.add_argument('--ckpt_path_teacher', default="/home/mpizarro/data/ibot_pretrained_teacher.pth", type=str)
+
+    # Speed (defaults keep the original training recipe; see david-ct/CODE.md)
+    parser.add_argument('--gpu_aug', type=utils.bool_flag, default=False, help="""swin3D only: workers just load
+        the volume and the multi-crop augmentation runs on the GPU (gpu_transforms.py) instead of on the CPU.""")
+    parser.add_argument('--amp_dtype', default='fp16', choices=['fp16', 'bf16'], help="""Autocast dtype when
+        --use_fp16 is true. bf16 needs no GradScaler.""")
+    parser.add_argument('--compile', type=utils.bool_flag, default=False, help="torch.compile the backbones.")
+    parser.add_argument('--fused_attn', type=utils.bool_flag, default=True, help="""swin3D: use
+        F.scaled_dot_product_attention in the window attention (numerically equivalent, less memory).""")
+    parser.add_argument('--persistent_workers', type=utils.bool_flag, default=True)
+    parser.add_argument('--prefetch_factor', type=int, default=4)
+    parser.add_argument('--pin_memory', type=utils.bool_flag, default=None, help="""Pin the loader's host
+        buffers. Default: off with --gpu_aug (raw volumes of many sizes: the pinned-memory cache grows by tens of GB
+        and stalls the loader for minutes at batch 32, while the copy it speeds up is <1%% of a step), on otherwise.""")
+    parser.add_argument('--log_freq', type=int, default=20, help="Print and sync metrics every N iterations.")
     return parser
 
 def train_ibot(args):
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
+    if args.pin_memory is None:
+        args.pin_memory = not (args.arch == "swin3D" and args.gpu_aug)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
     cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     # ============ preparing data ... ============
     transform = DataAugmentationCTiBOT2(
@@ -172,7 +192,25 @@ def train_ibot(args):
         args.local_crops_number,
     )
     pred_size = args.patch_size * 8 if 'swin' in args.arch else args.patch_size
-    if args.arch == "swin3D":
+    gpu_aug, collate_fn = None, None
+    if args.arch == "swin3D" and args.gpu_aug:
+        dataset = CTVolumeMask3D(
+            args.data_path,
+            crop_sizes=[224] * args.global_crops_number + [96] * args.local_crops_number,
+            patch_size=pred_size,
+            pred_ratio=args.pred_ratio,
+            pred_ratio_var=args.pred_ratio_var,
+            pred_aspect_ratio=(0.3, 1/0.3),
+            pred_shape=args.pred_shape,
+            pred_start_epoch=args.pred_start_epoch)
+        gpu_aug = GPUAugmentationCTiBOT(
+            args.global_crops_scale,
+            args.local_crops_scale,
+            args.global_crops_number,
+            args.local_crops_number,
+            seed=args.seed + utils.get_rank())
+        collate_fn = collate_volumes
+    elif args.arch == "swin3D":
         dataset = CTFolderMask3D(
             args.data_path, 
             transform=transform,
@@ -199,9 +237,14 @@ def train_ibot(args):
         sampler=sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
+        pin_memory=args.pin_memory,
+        drop_last=True,
+        collate_fn=collate_fn,
+        worker_init_fn=worker_init_fn,
+        persistent_workers=args.persistent_workers and args.num_workers > 0,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
+    data_loader.gpu_aug = gpu_aug
     print(f"Data loaded: there are {len(dataset)} images.")
 
     # ============ building student and teacher networks ... ============
@@ -224,9 +267,11 @@ def train_ibot(args):
         embed_dim = student.embed_dim
     elif args.arch == "swin3D":
         student = swin_3D(return_all_tokens=True, 
-            masked_im_modeling=args.use_masked_im_modeling
+            masked_im_modeling=args.use_masked_im_modeling,
+            fused_attn=args.fused_attn,
         )
-        teacher = swin_3D(return_all_tokens=True
+        teacher = swin_3D(return_all_tokens=True,
+            fused_attn=args.fused_attn,
         )
         embed_dim = student.num_features
     
@@ -286,6 +331,11 @@ def train_ibot(args):
     )
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
+    if args.compile:
+        # in-place Module.compile keeps the state_dict keys (checkpoints stay compatible);
+        # static shapes: one graph per crop size (global/local) instead of a slow dynamic-shape graph
+        student.backbone.compile(dynamic=False)
+        teacher.backbone.compile(dynamic=False)
     # synchronize batch norms (if any)
     if utils.has_batchnorms(student):
         student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
@@ -333,14 +383,14 @@ def train_ibot(args):
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
     if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(params_groups)  # to use with ViTs
+        optimizer = torch.optim.AdamW(params_groups, fused=True)  # to use with ViTs
     elif args.optimizer == "sgd":
         optimizer = torch.optim.SGD(params_groups, lr=0, momentum=0.9)  # lr is set by scheduler
     elif args.optimizer == "lars":
         optimizer = utils.LARS(params_groups)  # to use with convnet and large batches
     # for mixed precision training
     fp16_scaler = None
-    if args.use_fp16:
+    if args.use_fp16 and args.amp_dtype == 'fp16':
         fp16_scaler = torch.amp.GradScaler('cuda')
 
     # ============ init schedulers ... ============
@@ -431,23 +481,50 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
     params_q = [param_q for name_q, param_q in zip(names_q, params_q) if name_q in names_common]
     params_k = [param_k for name_k, param_k in zip(names_k, params_k) if name_k in names_common]
 
-    for it, (images, masks) in enumerate(metric_logger.log_every(data_loader, 20, header)):
+    params_q = [p.data for p in params_q]
+    params_k = [p.data for p in params_k]
+    amp_dtype = torch.bfloat16 if args.amp_dtype == 'bf16' else torch.float16
+
+    # per-iteration metrics stay on the GPU and are copied to the host in one transfer every --log_freq
+    # iterations: a .item() per metric (and per parameter in the old gradient clipping) stalls the CPU every step
+    pending = {}
+
+    def flush_metrics():
+        nonlocal pending
+        if not pending:
+            return
+        values = {k: torch.stack(v).tolist() for k, v in pending.items()}
+        pending = {}
+        if not all(math.isfinite(x) for x in values['loss']):
+            print("Loss is {}, stopping training".format(values['loss']), force=True)
+            sys.exit(1)
+        for k, vs in values.items():
+            for v in vs:
+                metric_logger.meters[k].update(v)
+
+    n_iters = len(data_loader)
+    it_in_epoch = 0
+    for it_in_epoch, (images, masks) in enumerate(metric_logger.log_every(data_loader, args.log_freq, header)):
         # update weight decay and learning rate according to their schedule
-        it = len(data_loader) * epoch + it  # global training iteration
+        it = len(data_loader) * epoch + it_in_epoch  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedule[it]
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
 
         # move images to gpu
-        images = [im.cuda(non_blocking=True) for im in images]
+        if data_loader.gpu_aug is not None:
+            # `images` are the raw volumes; crops are made on the GPU
+            images = data_loader.gpu_aug([v.cuda(non_blocking=True) for v in images])
+        else:
+            images = [im.cuda(non_blocking=True) for im in images]
         masks = [msk.cuda(non_blocking=True) for msk in masks]        
         
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=args.use_fp16):
             # get global views
             teacher_output = teacher(images[:args.global_crops_number])
             student_output = student(images[:args.global_crops_number], mask=masks[:args.global_crops_number])
-            
+
             # get local views
             student.module.backbone.masked_im_modeling = False
             student_local_cls = student(images[args.global_crops_number:])[0] if len(images) > args.global_crops_number else None
@@ -455,10 +532,6 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
 
             all_loss = ibot_loss(student_output, teacher_output, student_local_cls, masks, epoch)
             loss = all_loss.pop('loss')
-
-        if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()), force=True)
-            sys.exit(1)
 
         # log statistics
         probs1 = teacher_output[0].chunk(args.global_crops_number)
@@ -468,12 +541,11 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
         acc = (pred1 == pred2).sum() / pred1.size(0)
 
         # student update
-        optimizer.zero_grad()
-        param_norms = None
+        optimizer.zero_grad(set_to_none=True)
         if fp16_scaler is None:
             loss.backward()
             if args.clip_grad:
-                param_norms = utils.clip_gradients(student, args.clip_grad)
+                utils.clip_gradients_foreach(student, args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             optimizer.step()
@@ -481,32 +553,33 @@ def train_one_epoch(student, teacher, teacher_without_ddp, ibot_loss, data_loade
             fp16_scaler.scale(loss).backward()
             if args.clip_grad:
                 fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
-                param_norms = utils.clip_gradients(student, args.clip_grad)
+                utils.clip_gradients_foreach(student, args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
 
-        # EMA update for the teacher
+        # EMA update for the teacher (same math as param_k * m + (1 - m) * param_q, fused over all params)
         with torch.no_grad():
             m = momentum_schedule[it]  # momentum parameter
-            for param_q, param_k in zip(params_q, params_k):
-                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+            torch._foreach_mul_(params_k, m)
+            torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
         # logging
-        torch.cuda.synchronize()
-        metric_logger.update(loss=loss.item())
-        for key, value in all_loss.items():
-            metric_logger.update(**{key: value.item()})
+        for key, value in [('loss', loss), ('acc', acc)] + list(all_loss.items()):
+            pending.setdefault(key, []).append(value.detach().float())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
-        metric_logger.update(acc=acc)
-    
+        if it_in_epoch % args.log_freq == 0 or it_in_epoch == n_iters - 1:
+            flush_metrics()
+    flush_metrics()
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     return_dict = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-    
+
+
     return return_dict
 
 
